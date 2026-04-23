@@ -384,50 +384,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode != "normal" {
 			break
 		}
-		switch msg.Action {
-		case tea.MouseActionPress:
-			if msg.Button == tea.MouseButtonLeft {
-				q := quadFromXY(msg.X, msg.Y, m.width, m.height)
-				if q != m.focusedQuad {
-					m.focusedQuad = q
-					m.ensureScrollVisible(q)
-				}
-
-				quadY := 0
-				if q >= 2 {
-					quadY = m.height / 2
-				}
-				relY := msg.Y - quadY - 1
-				if relY > 0 {
-					idx := relY - 1 + m.quadrants[q].ScrollOff
-					maxIdx := len(m.quadrants[q].Tasks)
-					if idx >= 0 && idx <= maxIdx {
-						m.quadrants[q].SelectedIdx = idx
-						m.ensureScrollVisible(q)
-					}
-				}
-
-				if m.quadrants[q].SelectedIdx < len(m.quadrants[q].Tasks) {
-					m.dragging = true
-					m.dragQuad = q
-					m.dragIdx = m.quadrants[q].SelectedIdx
-					m.dragX = msg.X
-					m.dragY = msg.Y
-				}
-			}
-		case tea.MouseActionRelease:
-			if m.dragging && msg.Button == tea.MouseButtonLeft {
-				targetQ := quadFromXY(msg.X, msg.Y, m.width, m.height)
-				m.moveTask(m.dragQuad, m.dragIdx, targetQ)
-				if targetQ != m.focusedQuad {
-					m.focusedQuad = targetQ
-				}
-				m.dragging = false
-			}
-		case tea.MouseActionMotion:
-			if m.dragging {
-				m.dragX = msg.X
-				m.dragY = msg.Y
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			q := quadFromXY(msg.X, msg.Y, m.width, m.height)
+			if q != m.focusedQuad {
+				m.focusedQuad = q
+				m.ensureScrollVisible(q)
 			}
 		}
 	}
@@ -527,12 +488,6 @@ func (m Model) View() string {
 	topRow := lipgloss.JoinHorizontal(lipgloss.Top, quads[0], quads[1])
 	bottomRow := lipgloss.JoinHorizontal(lipgloss.Top, quads[2], quads[3])
 	grid := lipgloss.JoinVertical(lipgloss.Left, topRow, bottomRow)
-
-	if m.dragging {
-		taskText := m.quadrants[m.dragQuad].Tasks[m.dragIdx].Text
-		indicator := dragStyle.Render("↻  " + truncateText(taskText, m.width-6))
-		grid = lipgloss.JoinVertical(lipgloss.Left, grid, indicator)
-	}
 
 	if m.mode == "add" || m.mode == "edit" {
 		label := "New Task"

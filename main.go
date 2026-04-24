@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -25,6 +28,17 @@ type Quadrant struct {
 	ScrollOff   int
 }
 
+type AppState struct {
+	Quadrants [4][]Task `json:"quadrants"`
+}
+
+const (
+	modeNormal    = "normal"
+	modeAdd       = "add"
+	modeEdit      = "edit"
+	stateFileName = "tasks.json"
+)
+
 // ─── App Model ───────────────────────────────────────────────────────────────
 
 type Model struct {
@@ -32,13 +46,10 @@ type Model struct {
 	focusedQuad int
 	width       int
 	height      int
-	mode        string // "normal", "add", "edit"
+	mode        string
 	textInput   textinput.Model
-	dragging    bool
-	dragQuad    int
-	dragIdx     int
-	dragX       int
-	dragY       int
+	statePath   string
+	status      string
 }
 
 // ─── Styles ──────────────────────────────────────────────────────────────────
@@ -47,7 +58,6 @@ var (
 	subtle    = lipgloss.AdaptiveColor{Light: "#555555", Dark: "#777777"}
 	highlight = lipgloss.AdaptiveColor{Light: "#333333", Dark: "#EEEEEE"}
 	blue      = lipgloss.Color("#61AFEF")
-	yellow    = lipgloss.Color("#E5C07B")
 	faint     = lipgloss.AdaptiveColor{Light: "#AAAAAA", Dark: "#555555"}
 
 	focusedStyle = lipgloss.NewStyle().
@@ -65,7 +75,7 @@ var (
 				Foreground(lipgloss.Color("#FFFFFF"))
 
 	normalTaskStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#ABB2BF"))
+			Foreground(lipgloss.Color("#ABB2BF"))
 
 	completedTaskStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#555555"))
@@ -82,13 +92,41 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(blue).
 			Padding(1, 2)
-
-	dragStyle = lipgloss.NewStyle().
-			Foreground(yellow).
-			Bold(true)
 )
 
 // ─── Initialization ──────────────────────────────────────────────────────────
+
+func defaultQuadrants() [4]Quadrant {
+	return [4]Quadrant{
+		{
+			Header: "IMPORTANT, NOT URGENT -> SCHEDULE",
+			Tasks: []Task{
+				{Text: "3b1b Image Video Gen Lecture"},
+				{Text: "3b1b Linear Algebra"},
+				{Text: "Micrograd Project"},
+				{Text: "Six Easy Pieces Reading"},
+			},
+		},
+		{
+			Header: "IMPORTANT, URGENT -> DO NOW",
+			Tasks: []Task{
+				{Text: "Maths 2 Multivar calculus"},
+				{Text: "Mindmap of Calculus"},
+			},
+		},
+		{
+			Header: "NOT IMPORTANT, NOT URGENT -> DELETE",
+		},
+		{
+			Header: "URGENT, NOT IMPORTANT -> BATCH / DELAY",
+			Tasks: []Task{
+				{Text: "Gradient Theory", Date: "Apr 14"},
+				{Text: "Project based learning"},
+				{Text: "Get a Floss"},
+			},
+		},
+	}
+}
 
 func initialModel() Model {
 	ti := textinput.New()
@@ -96,41 +134,29 @@ func initialModel() Model {
 	ti.CharLimit = 120
 	ti.Width = 40
 
-	return Model{
-		quadrants: [4]Quadrant{
-			{
-				Header: "IMP BUT NOT URGENT -> SCHEDULE (MOST IMP)",
-				Tasks: []Task{
-					{Text: "3b1b Image Video Gen Lecture"},
-					{Text: "3b1b Linear Algebra"},
-					{Text: "Micrograd Project"},
-					{Text: "Six Easy Pieces Reading"},
-				},
-			},
-			{
-				Header: "IMPORTANT & URGENT - FOCUS",
-				Tasks: []Task{
-					{Text: "Maths 2 Multivar calculus"},
-					{Text: "Mindmap of Calculus"},
-				},
-			},
-			{
-				Header: "NOT IMP or URGENT -> DELETE",
-				Tasks:  []Task{},
-			},
-			{
-				Header: "URGENT BUT NOT IMP -> BATCH + DELAY",
-				Tasks: []Task{
-					{Text: "Gradient Theory", Date: "Apr 14"},
-					{Text: "Project based learning"},
-					{Text: "Get a Floss"},
-				},
-			},
-		},
+	model := Model{
+		quadrants:   defaultQuadrants(),
 		focusedQuad: 0,
-		mode:        "normal",
+		mode:        modeNormal,
 		textInput:   ti,
+		status:      "Tasks auto-save locally",
 	}
+
+	statePath, err := stateFilePath()
+	if err != nil {
+		model.status = "Autosave unavailable: " + err.Error()
+		return model
+	}
+
+	model.statePath = statePath
+	loaded, err := model.loadState()
+	if err != nil {
+		model.status = "Load failed: " + err.Error()
+	} else if loaded {
+		model.status = "Loaded saved tasks"
+	}
+
+	return model
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -143,8 +169,13 @@ func (m Model) quadWidth() int {
 	return w
 }
 
+func (m Model) footerHeight() int {
+	return 2
+}
+
 func (m Model) quadHeight() int {
-	h := m.height/2 - 2
+	usableHeight := max(0, m.height-m.footerHeight())
+	h := usableHeight/2 - 2
 	if h < 4 {
 		h = 4
 	}
@@ -182,12 +213,105 @@ func (m *Model) ensureScrollVisible(qIdx int) {
 	}
 }
 
-func (m *Model) moveTask(fromQuad, fromIdx, toQuad int) {
-	if fromQuad == toQuad {
+func stateFilePath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err == nil && configDir != "" {
+		return filepath.Join(configDir, "eisenhowermatrix", stateFileName), nil
+	}
+
+	wd, wdErr := os.Getwd()
+	if wdErr != nil {
+		if err != nil {
+			return "", err
+		}
+		return "", wdErr
+	}
+
+	return filepath.Join(wd, "."+stateFileName), nil
+}
+
+func snapshotState(quadrants [4]Quadrant) AppState {
+	var state AppState
+	for i := range quadrants {
+		state.Quadrants[i] = append([]Task(nil), quadrants[i].Tasks...)
+	}
+	return state
+}
+
+func applyState(quadrants *[4]Quadrant, state AppState) {
+	for i := range quadrants {
+		quadrants[i].Tasks = append([]Task(nil), state.Quadrants[i]...)
+		quadrants[i].SelectedIdx = 0
+		quadrants[i].ScrollOff = 0
+	}
+}
+
+func loadStateFile(path string) (AppState, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return AppState{}, false, nil
+		}
+		return AppState{}, false, err
+	}
+
+	var state AppState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return AppState{}, false, err
+	}
+
+	return state, true, nil
+}
+
+func saveStateFile(path string, state AppState) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o644)
+}
+
+func (m *Model) loadState() (bool, error) {
+	if m.statePath == "" {
+		return false, nil
+	}
+
+	state, loaded, err := loadStateFile(m.statePath)
+	if err != nil || !loaded {
+		return loaded, err
+	}
+
+	applyState(&m.quadrants, state)
+	for i := range m.quadrants {
+		m.ensureScrollVisible(i)
+	}
+
+	return true, nil
+}
+
+func (m *Model) persist(successStatus string) {
+	if m.statePath == "" {
 		return
 	}
-	if fromIdx < 0 || fromIdx >= len(m.quadrants[fromQuad].Tasks) {
+	if err := saveStateFile(m.statePath, snapshotState(m.quadrants)); err != nil {
+		m.status = "Save failed: " + err.Error()
 		return
+	}
+	m.status = successStatus
+}
+
+func (m *Model) moveTask(fromQuad, fromIdx, toQuad int) bool {
+	if fromQuad == toQuad {
+		return false
+	}
+	if fromIdx < 0 || fromIdx >= len(m.quadrants[fromQuad].Tasks) {
+		return false
 	}
 	task := m.quadrants[fromQuad].Tasks[fromIdx]
 	m.quadrants[fromQuad].Tasks = append(
@@ -203,14 +327,18 @@ func (m *Model) moveTask(fromQuad, fromIdx, toQuad int) {
 		m.quadrants[fromQuad].SelectedIdx = 0
 	}
 	m.quadrants[toQuad].SelectedIdx = len(m.quadrants[toQuad].Tasks) - 1
+	m.focusedQuad = toQuad
 	m.ensureScrollVisible(fromQuad)
 	m.ensureScrollVisible(toQuad)
+	m.persist(fmt.Sprintf("Moved %q to quadrant %d", task.Text, toQuad+1))
+	return true
 }
 
-func (m *Model) deleteTask(qIdx, tIdx int) {
+func (m *Model) deleteTask(qIdx, tIdx int) bool {
 	if tIdx < 0 || tIdx >= len(m.quadrants[qIdx].Tasks) {
-		return
+		return false
 	}
+	taskText := m.quadrants[qIdx].Tasks[tIdx].Text
 	m.quadrants[qIdx].Tasks = append(
 		m.quadrants[qIdx].Tasks[:tIdx],
 		m.quadrants[qIdx].Tasks[tIdx+1:]...,
@@ -222,40 +350,60 @@ func (m *Model) deleteTask(qIdx, tIdx int) {
 		m.quadrants[qIdx].SelectedIdx = 0
 	}
 	m.ensureScrollVisible(qIdx)
+	m.persist(fmt.Sprintf("Deleted %q", taskText))
+	return true
 }
 
 func parseTaskInput(input string) (text, date string) {
-	parts := strings.SplitN(input, " | ", 2)
-	text = strings.TrimSpace(parts[0])
-	if len(parts) > 1 {
-		date = strings.TrimSpace(parts[1])
+	text, date, found := strings.Cut(input, "|")
+	text = strings.TrimSpace(text)
+	if found {
+		date = strings.TrimSpace(date)
 	}
 	return
 }
 
-func (m *Model) addTask(qIdx int, text string) {
+func (m *Model) addTask(qIdx int, text string) bool {
 	if strings.TrimSpace(text) == "" {
-		return
+		return false
 	}
 	taskText, date := parseTaskInput(text)
 	if taskText == "" {
-		return
+		return false
 	}
 	m.quadrants[qIdx].Tasks = append(m.quadrants[qIdx].Tasks, Task{Text: taskText, Date: date})
 	m.quadrants[qIdx].SelectedIdx = len(m.quadrants[qIdx].Tasks) - 1
 	m.ensureScrollVisible(qIdx)
+	m.persist(fmt.Sprintf("Added %q", taskText))
+	return true
 }
 
-func (m *Model) updateTask(qIdx, tIdx int, text string) {
+func (m *Model) updateTask(qIdx, tIdx int, text string) bool {
 	if tIdx < 0 || tIdx >= len(m.quadrants[qIdx].Tasks) {
-		return
+		return false
 	}
 	taskText, date := parseTaskInput(text)
 	if taskText == "" {
-		return
+		return false
 	}
 	m.quadrants[qIdx].Tasks[tIdx].Text = taskText
 	m.quadrants[qIdx].Tasks[tIdx].Date = date
+	m.persist(fmt.Sprintf("Updated %q", taskText))
+	return true
+}
+
+func (m *Model) toggleTask(qIdx, tIdx int) bool {
+	if tIdx < 0 || tIdx >= len(m.quadrants[qIdx].Tasks) {
+		return false
+	}
+	task := &m.quadrants[qIdx].Tasks[tIdx]
+	task.Completed = !task.Completed
+	if task.Completed {
+		m.persist(fmt.Sprintf("Completed %q", task.Text))
+	} else {
+		m.persist(fmt.Sprintf("Reopened %q", task.Text))
+	}
+	return true
 }
 
 func quadFromXY(x, y, w, h int) int {
@@ -300,38 +448,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.textInput.Width = min(50, m.width-10)
+		m.textInput.Width = max(20, min(50, m.width-10))
 		for i := range m.quadrants {
 			m.ensureScrollVisible(i)
 		}
 
 	case tea.KeyMsg:
 		switch m.mode {
-		case "add", "edit":
+		case modeAdd, modeEdit:
 			switch msg.Type {
 			case tea.KeyEsc:
-				m.mode = "normal"
+				m.mode = modeNormal
 				m.textInput.SetValue("")
+				m.textInput.Blur()
+				m.status = "Cancelled editor"
 				return m, nil
 			case tea.KeyEnter:
 				val := m.textInput.Value()
-				if m.mode == "add" {
-					m.addTask(m.focusedQuad, val)
+				var ok bool
+				if m.mode == modeAdd {
+					ok = m.addTask(m.focusedQuad, val)
 				} else {
-					m.updateTask(m.focusedQuad, m.quadrants[m.focusedQuad].SelectedIdx, val)
+					ok = m.updateTask(m.focusedQuad, m.quadrants[m.focusedQuad].SelectedIdx, val)
 				}
-				m.mode = "normal"
+				if !ok {
+					m.status = "Task text cannot be empty"
+					return m, nil
+				}
+				m.mode = modeNormal
 				m.textInput.SetValue("")
+				m.textInput.Blur()
 				return m, nil
 			}
 			var cmd tea.Cmd
 			m.textInput, cmd = m.textInput.Update(msg)
 			return m, cmd
 
-		default: // normal mode
+		default:
 			switch msg.String() {
 			case "q", "ctrl+c":
 				return m, tea.Quit
+			case "a", "n":
+				m.textInput.SetValue("")
+				m.textInput.Focus()
+				m.mode = modeAdd
+				m.status = "Adding a task"
+				return m, textinput.Blink
 			case "tab":
 				m.focusedQuad = (m.focusedQuad + 1) % 4
 				m.ensureScrollVisible(m.focusedQuad)
@@ -363,29 +525,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						val += " | " + q.Tasks[q.SelectedIdx].Date
 					}
 					m.textInput.SetValue(val)
-					m.mode = "edit"
+					m.mode = modeEdit
+					m.status = "Editing selected task"
 				} else {
 					m.textInput.SetValue("")
-					m.mode = "add"
+					m.mode = modeAdd
+					m.status = "Adding a task"
 				}
 				m.textInput.Focus()
 				return m, textinput.Blink
 			case "d", "delete":
-				m.deleteTask(m.focusedQuad, m.quadrants[m.focusedQuad].SelectedIdx)
+				if !m.deleteTask(m.focusedQuad, m.quadrants[m.focusedQuad].SelectedIdx) {
+					m.status = "No task selected to delete"
+				}
 			case " ":
-				q := &m.quadrants[m.focusedQuad]
-				if q.SelectedIdx >= 0 && q.SelectedIdx < len(q.Tasks) {
-					q.Tasks[q.SelectedIdx].Completed = !q.Tasks[q.SelectedIdx].Completed
+				if !m.toggleTask(m.focusedQuad, m.quadrants[m.focusedQuad].SelectedIdx) {
+					m.status = "No task selected to toggle"
+				}
+			case "1", "2", "3", "4":
+				targetQuad := int(msg.String()[0] - '1')
+				if !m.moveTask(m.focusedQuad, m.quadrants[m.focusedQuad].SelectedIdx, targetQuad) {
+					if targetQuad == m.focusedQuad {
+						m.status = fmt.Sprintf("Already in quadrant %d", targetQuad+1)
+					} else {
+						m.status = "No task selected to move"
+					}
 				}
 			}
 		}
 
 	case tea.MouseMsg:
-		if m.mode != "normal" {
+		if m.mode != modeNormal {
+			break
+		}
+		if msg.Y >= m.height-m.footerHeight() {
 			break
 		}
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			q := quadFromXY(msg.X, msg.Y, m.width, m.height)
+			q := quadFromXY(msg.X, msg.Y, m.width, m.height-m.footerHeight())
 			if q != m.focusedQuad {
 				m.focusedQuad = q
 				m.ensureScrollVisible(q)
@@ -393,7 +570,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	if m.mode == "add" || m.mode == "edit" {
+	if m.mode == modeAdd || m.mode == modeEdit {
 		var cmd tea.Cmd
 		m.textInput, cmd = m.textInput.Update(msg)
 		cmds = append(cmds, cmd)
@@ -421,7 +598,7 @@ func (m Model) View() string {
 		style = style.Width(qw).Height(qh)
 
 		headerStyle := lipgloss.NewStyle().Bold(true).Foreground(highlight)
-		header := headerStyle.Render(truncateText(q.Header, qw-2))
+		header := headerStyle.Render(truncateText(fmt.Sprintf("%d. %s", i+1, q.Header), qw-2))
 
 		var tasks []string
 		start := q.ScrollOff
@@ -472,7 +649,7 @@ func (m Model) View() string {
 		}
 
 		if len(q.Tasks) == 0 {
-			tasks = append(tasks, placeholderStyle.Render("  Tap to add task"))
+			tasks = append(tasks, placeholderStyle.Render("  Press a or Enter to add"))
 		} else if i == m.focusedQuad && q.SelectedIdx == len(q.Tasks) && len(tasks) < vis {
 			tasks = append(tasks, placeholderStyle.Render("  ── add task ──"))
 		}
@@ -489,26 +666,36 @@ func (m Model) View() string {
 	bottomRow := lipgloss.JoinHorizontal(lipgloss.Top, quads[2], quads[3])
 	grid := lipgloss.JoinVertical(lipgloss.Left, topRow, bottomRow)
 
-	if m.mode == "add" || m.mode == "edit" {
+	if m.mode == modeAdd || m.mode == modeEdit {
 		label := "New Task"
-		if m.mode == "edit" {
+		if m.mode == modeEdit {
 			label = "Edit Task"
 		}
-		hint := lipgloss.NewStyle().Faint(true).MarginTop(1).Render("Use  |  to add a date")
+		hint := lipgloss.NewStyle().Faint(true).MarginTop(1).Render("Use | to add a date")
 		modalContent := lipgloss.JoinVertical(lipgloss.Center,
 			lipgloss.NewStyle().Bold(true).MarginBottom(1).Render(label),
 			m.textInput.View(),
 			hint,
 		)
 		modal := modalStyle.Render(modalContent)
-		grid = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
+		grid = lipgloss.Place(m.width, max(0, m.height-m.footerHeight()), lipgloss.Center, lipgloss.Center, modal)
 	}
 
-	return grid
+	help := placeholderStyle.Render(truncateText("Tab/Shift+Tab or h/j/k/l focus • Enter edit/add • a add • Space done • 1-4 move • d delete • q quit", m.width))
+	status := dateStyle.Render(truncateText(m.status, m.width))
+
+	return lipgloss.JoinVertical(lipgloss.Left, grid, help, status)
 }
 
 func min(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b
